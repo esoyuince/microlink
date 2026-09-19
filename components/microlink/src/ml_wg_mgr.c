@@ -460,6 +460,8 @@ static int add_peer(microlink_t *ml, const ml_peer_update_t *update) {
     p->has_direct_path = false;
     p->best_ip = 0;
     p->best_port = 0;
+    p->direct_ping_validated = false;
+    p->last_init_handshake_ms = 0;
     p->wg_peer_index = -1;
 
     char ip_str[16];
@@ -497,18 +499,9 @@ static int add_peer(microlink_t *ml, const ml_peer_update_t *update) {
         IP4_ADDR(&wg_peer.allowed_ip.u_addr.ip4, ip_a, ip_b, ip_c, ip_d);
         IP4_ADDR(&wg_peer.allowed_mask.u_addr.ip4, 255, 255, 255, 255);
 
-        /* Set endpoint if available, otherwise leave blank for DERP-only */
-        if (p->endpoint_count > 0 && p->endpoints[0].ip != 0) {
-            uint8_t ea = (p->endpoints[0].ip >> 24) & 0xFF;
-            uint8_t eb = (p->endpoints[0].ip >> 16) & 0xFF;
-            uint8_t ec = (p->endpoints[0].ip >> 8) & 0xFF;
-            uint8_t ed = p->endpoints[0].ip & 0xFF;
-            IP4_ADDR(&wg_peer.endpoint_ip.u_addr.ip4, ea, eb, ec, ed);
-            wg_peer.endport_port = p->endpoints[0].port;
-        } else {
-            ip_addr_set_any(false, &wg_peer.endpoint_ip);
-            wg_peer.endport_port = 0;
-        }
+        /* Advertised MapResponse endpoints are probe candidates, not validated WG paths. */
+        ip_addr_set_any(false, &wg_peer.endpoint_ip);
+        wg_peer.endport_port = 0;
 
         wg_peer.keep_alive = 25;
 
@@ -837,6 +830,14 @@ static void process_disco_ping(microlink_t *ml, const ml_rx_packet_t *pkt,
     ESP_LOGI(TAG, "DISCO PING from %s (via %s)",
              p->hostname, pkt->via_derp ? "DERP" : "direct");
 
+    if (!pkt->via_derp && pkt->src_ip != 0 && pkt->src_port != 0) {
+        p->best_ip = pkt->src_ip;
+        p->best_port = pkt->src_port;
+        p->has_direct_path = true;
+        p->direct_ping_validated = true;
+        p->trust_until_ms = ml_get_time_ms() + ML_DISCO_TRUST_DURATION_MS;
+    }
+
     /* Build PONG */
     uint8_t pong[256];
     size_t pong_len = 0;
@@ -921,7 +922,9 @@ static void process_disco_pong(microlink_t *ml, const ml_rx_packet_t *pkt,
         p->last_pong_recv_ms = now;
 
         /* If direct reply, update best path */
-        if (!pkt->via_derp && pkt->src_ip != 0) {
+        if (!pkt->via_derp && pkt->src_ip != 0 &&
+            (!p->direct_ping_validated ||
+             (p->best_ip == pkt->src_ip && p->best_port == pkt->src_port))) {
             p->best_ip = pkt->src_ip;
             p->best_port = pkt->src_port;
             p->has_direct_path = true;
@@ -962,33 +965,20 @@ static void process_disco_pong(microlink_t *ml, const ml_rx_packet_t *pkt,
                              (int)((pkt->src_ip >> 24) & 0xFF), (int)((pkt->src_ip >> 16) & 0xFF),
                              (int)((pkt->src_ip >> 8) & 0xFF), (int)(pkt->src_ip & 0xFF),
                              (int)pkt->src_port, p->hostname);
-                    /* First direct path discovery — send a one-shot handshake
-                     * via direct UDP. Do NOT use wireguardif_connect() which
-                     * sets peer->active=true and causes infinite handshake
-                     * retries (every 5s) when the peer has us trimmed.
-                     * Instead, just fire a single handshake init. If the peer
-                     * has us configured, it will respond and establish session.
-                     * If not, we stop and wait for them to initiate. */
-                    if (!p->tried_initial_handshake) {
-                        p->tried_initial_handshake = true;
-                        /* Store endpoint so wireguardif_connect sends to it */
+                    /* Retry a direct handshake at a bounded interval until a session exists. */
+#define INITIAL_HANDSHAKE_RETRY_MS 30000ULL
+                    bool first_try = (p->last_init_handshake_ms == 0);
+                    bool retry_due = !first_try &&
+                        (now - p->last_init_handshake_ms > INITIAL_HANDSHAKE_RETRY_MS);
+                    if (first_try || retry_due) {
+                        p->last_init_handshake_ms = now;
                         wireguardif_update_endpoint(netif, (u8_t)p->wg_peer_index,
                                                      &ep_ip, pkt->src_port);
-                        /* Fire one handshake init but don't leave peer active.
-                         * wireguardif_connect sets active=true internally, so
-                         * we immediately clear it after to prevent retries. */
                         wireguardif_connect(netif, (u8_t)p->wg_peer_index);
-                        /* Clear active to prevent infinite retry loop.
-                         * If handshake succeeds, the response handler will
-                         * establish the session regardless of active flag. */
-                        {
-                            struct wireguard_device *dev = (struct wireguard_device *)netif->state;
-                            if (dev && p->wg_peer_index < WIREGUARD_MAX_PEERS) {
-                                dev->peers[p->wg_peer_index].active = false;
-                            }
-                        }
-                        ESP_LOGI(TAG, "WG one-shot handshake to %s (first direct path)", p->hostname);
+                        ESP_LOGI(TAG, "WG direct handshake %s to %s",
+                                 first_try ? "init" : "retry", p->hostname);
                     }
+#undef INITIAL_HANDSHAKE_RETRY_MS
                 }
             }
         }
@@ -1430,6 +1420,7 @@ static void disco_periodic_probes(microlink_t *ml) {
         if (p->has_direct_path && now > p->trust_until_ms) {
             ESP_LOGI(TAG, "Direct path to %s expired, reverting to DERP", p->hostname);
             p->has_direct_path = false;
+            p->direct_ping_validated = false;
 
             /* Only do DERP fallback + re-probe for allowed peers.
              * Non-allowed peers just get their state cleaned above. */
@@ -1537,6 +1528,7 @@ void ml_wg_mgr_task(void *arg) {
 
     uint64_t last_disco_probe_ms = 0;
     uint64_t last_wg_periodic_ms = 0;
+    uint64_t last_stack_report_ms = 0;
     bool derp_was_connected = false;
     bool stun_cmm_sent = false;  /* One-shot: send CMMs after first STUN result */
 
@@ -1612,7 +1604,7 @@ void ml_wg_mgr_task(void *arg) {
         }
 
         /* Run WireGuard periodic processing (handshakes, keepalives, rekeys).
-         * This runs on OUR task stack (8KB) instead of the lwIP TCPIP thread (3-8KB),
+         * This runs on OUR task stack (12KB) instead of the lwIP TCPIP thread (3-8KB),
          * preventing heavy crypto (X25519, ChaCha20-Poly1305) from monopolizing
          * the TCPIP thread and blocking all socket operations system-wide. */
         uint64_t now = ml_get_time_ms();
@@ -1632,6 +1624,10 @@ void ml_wg_mgr_task(void *arg) {
             uint64_t dt = ml_get_time_ms() - t0;
             last_disco_probe_ms = now;
             ESP_LOGI(TAG, "disco_periodic_probes: %llu ms", (unsigned long long)dt);
+        }
+        if (now - last_stack_report_ms > 10000) {
+            last_stack_report_ms = now;
+            ESP_LOGI(TAG, "WG_STACK highwater=%lu", (unsigned long)uxTaskGetStackHighWaterMark(NULL));
         }
 
         /* Yield - 10ms loop rate for minimum packet processing latency.

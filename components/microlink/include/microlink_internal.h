@@ -55,7 +55,7 @@ extern "C" {
 #define ML_TASK_COORD_PRIO      5
 #define ML_TASK_COORD_CORE      1
 
-#define ML_TASK_WG_MGR_STACK    (8 * 1024)
+#define ML_TASK_WG_MGR_STACK    (12 * 1024)
 #define ML_TASK_WG_MGR_PRIO     7
 #define ML_TASK_WG_MGR_CORE     1
 
@@ -265,12 +265,13 @@ typedef struct {
     uint32_t best_ip;
     uint16_t best_port;
     bool has_direct_path;
+    bool direct_ping_validated;
 
     /* WireGuard peer index in wireguard-lwip */
     int wg_peer_index;
 
-    /* On-demand handshake: tried once on first DISCO direct path discovery */
-    bool tried_initial_handshake;
+    /* On-demand direct handshake retry timestamp. */
+    uint64_t last_init_handshake_ms;
 } ml_peer_t;
 
 /* ============================================================================
