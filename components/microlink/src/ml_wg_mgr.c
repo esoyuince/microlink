@@ -181,12 +181,52 @@ static err_t wg_derp_output_cb(const uint8_t *peer_public_key,
  * on that thread. */
 static struct udp_pcb *s_wg_output_pcb = NULL;
 
+typedef struct {
+    struct udp_pcb *pcb;
+    ip_addr_t dst;
+    uint16_t port;
+    uint16_t len;
+    uint8_t data[];
+} wg_tx_defer_t;
+
+typedef struct {
+    struct pbuf_custom pc;
+    void *payload_mem;
+} ml_spiram_pbuf_t;
+
+static void ml_spiram_pbuf_free_fn(struct pbuf *p) {
+    ml_spiram_pbuf_t *wrap = (ml_spiram_pbuf_t *)p;
+    heap_caps_free(wrap->payload_mem);
+    heap_caps_free(wrap);
+}
+
+static struct pbuf *wg_alloc_tx_pbuf(const uint8_t *data, uint16_t len) {
+    ml_spiram_pbuf_t *wrap = heap_caps_malloc(sizeof(*wrap), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    if (!wrap) return NULL;
+    wrap->payload_mem = ml_psram_malloc(len);
+    if (!wrap->payload_mem) { heap_caps_free(wrap); return NULL; }
+    memcpy(wrap->payload_mem, data, len);
+    wrap->pc.custom_free_function = ml_spiram_pbuf_free_fn;
+    struct pbuf *p = pbuf_alloced_custom(PBUF_RAW, len, PBUF_REF, &wrap->pc, wrap->payload_mem, len);
+    if (!p) { heap_caps_free(wrap->payload_mem); heap_caps_free(wrap); return NULL; }
+    return p;
+}
+
+static void wg_send_in_tcpip(void *arg) {
+    wg_tx_defer_t *d = (wg_tx_defer_t *)arg;
+    struct pbuf *p = wg_alloc_tx_pbuf(d->data, d->len);
+    if (p) {
+        udp_sendto(d->pcb, p, &d->dst, d->port);
+        pbuf_free(p);
+    }
+    free(d);
+}
+
 static err_t wg_udp_output_cb(uint32_t dest_ip, uint16_t dest_port,
                                 const uint8_t *data, size_t len, void *ctx) {
     microlink_t *ml = (microlink_t *)ctx;
-    if (!ml) return ERR_CONN;
+    if (!ml || len > UINT16_MAX) return ERR_CONN;
 
-    /* Log WG packets sent via direct UDP */
     uint32_t ip_host = ntohl(dest_ip);
     ESP_LOGI(TAG, "WG UDP TX: %d bytes -> %d.%d.%d.%d:%d type=%d",
              (int)len,
@@ -195,20 +235,32 @@ static err_t wg_udp_output_cb(uint32_t dest_ip, uint16_t dest_port,
              (int)dest_port,
              len >= 1 ? data[0] : -1);
 
-    /* Use raw PCB to send — safe from any thread context */
     if (!s_wg_output_pcb) return ERR_CONN;
-
-    struct pbuf *p = pbuf_alloc(PBUF_TRANSPORT, len, PBUF_RAM);
-    if (!p) return ERR_MEM;
-    memcpy(p->payload, data, len);
 
     ip_addr_t dst;
     IP_SET_TYPE_VAL(dst, IPADDR_TYPE_V4);
-    ip4_addr_set_u32(ip_2_ip4(&dst), dest_ip);  /* already network byte order */
+    ip4_addr_set_u32(ip_2_ip4(&dst), dest_ip);
 
-    err_t err = udp_sendto(s_wg_output_pcb, p, &dst, dest_port);
-    pbuf_free(p);
-    return err;
+    if (sys_thread_tcpip(LWIP_CORE_LOCK_QUERY_HOLDER)) {
+        struct pbuf *p = wg_alloc_tx_pbuf(data, (uint16_t)len);
+        if (!p) return ERR_MEM;
+        err_t err = udp_sendto(s_wg_output_pcb, p, &dst, dest_port);
+        pbuf_free(p);
+        return err;
+    }
+
+    wg_tx_defer_t *d = (wg_tx_defer_t *)ml_psram_malloc(sizeof(*d) + len);
+    if (!d) return ERR_MEM;
+    d->pcb = s_wg_output_pcb;
+    d->dst = dst;
+    d->port = dest_port;
+    d->len = (uint16_t)len;
+    memcpy(d->data, data, len);
+    if (tcpip_try_callback(wg_send_in_tcpip, d) != ERR_OK) {
+        free(d);
+        return ERR_MEM;
+    }
+    return ERR_OK;
 }
 
 /* ============================================================================
@@ -1025,7 +1077,7 @@ static void process_disco_packet(microlink_t *ml, const ml_rx_packet_t *pkt) {
     if (ciphertext_len < NACL_BOX_MACBYTES) return;
 
     size_t plaintext_len = ciphertext_len - NACL_BOX_MACBYTES;
-    uint8_t *plaintext = malloc(plaintext_len);
+    uint8_t *plaintext = ml_psram_malloc(plaintext_len);
     if (!plaintext) return;
 
     if (nacl_box_open(plaintext, ciphertext, ciphertext_len, nonce,

@@ -416,7 +416,7 @@ static int poll_derp_read(microlink_t *ml) {
     /* For RecvPacket (0x05): first 32 bytes are sender's public key */
     if (frame_type == DERP_FRAME_RECV_PACKET && len > 32) {
         memcpy(src_key, buf, 32);
-        payload = malloc(len - 32);
+        payload = ml_psram_malloc(len - 32);
         if (payload) {
             memcpy(payload, buf + 32, len - 32);
             payload_len = len - 32;
@@ -440,7 +440,7 @@ esp_err_t ml_derp_queue_send(microlink_t *ml, const uint8_t *dest_key,
                               const uint8_t *data, size_t len) {
     if (!ml || !dest_key || !data || len == 0) return ESP_ERR_INVALID_ARG;
 
-    uint8_t *pkt_data = malloc(len);
+    uint8_t *pkt_data = ml_psram_malloc(len);
     if (!pkt_data) return ESP_ERR_NO_MEM;
     memcpy(pkt_data, data, len);
 
