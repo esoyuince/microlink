@@ -823,7 +823,7 @@ void wireguardif_network_rx(void *arg, struct udp_pcb *pcb, struct pbuf *p, cons
 					// Process the handshake response
 					wireguardif_process_response_message(device, peer, msg_response, addr, port);
 				} else {
-					printf("[WG_RX] ERROR: No peer found for receiver_idx=%lu\n", (unsigned long)msg_response->receiver);
+					printf("[WG_RX] Stale/duplicate handshake response ignored receiver_idx=%lu\n", (unsigned long)msg_response->receiver);
 				}
 			} else {
 				printf("[WG_RX] Response MAC check FAILED\n");

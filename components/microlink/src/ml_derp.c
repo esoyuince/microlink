@@ -631,6 +631,8 @@ void ml_derp_tx_task(void *arg) {
     }
 
     ESP_LOGI(TAG, "DERP I/O task exiting");
+    ml->derp_tx_task = NULL;
+    xEventGroupSetBits(ml->events, ML_EVT_DERP_TASK_EXITED);
     vTaskDelete(NULL);
 }
 

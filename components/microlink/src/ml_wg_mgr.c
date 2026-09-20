@@ -1561,6 +1561,8 @@ void ml_wg_mgr_task(void *arg) {
 
     if (wait_bits & ML_EVT_SHUTDOWN_REQUEST) {
         ESP_LOGI(TAG, "Shutdown requested before registration, exiting");
+        ml->wg_mgr_task = NULL;
+        xEventGroupSetBits(ml->events, ML_EVT_WG_TASK_EXITED);
         vTaskDelete(NULL);
         return;  /* Not reached */
     }
@@ -1700,5 +1702,7 @@ void ml_wg_mgr_task(void *arg) {
     }
 
     ESP_LOGI(TAG, "WG Manager task exiting");
+    ml->wg_mgr_task = NULL;
+    xEventGroupSetBits(ml->events, ML_EVT_WG_TASK_EXITED);
     vTaskDelete(NULL);
 }

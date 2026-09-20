@@ -509,19 +509,29 @@ esp_err_t microlink_stop(microlink_t *ml) {
     if (!ml) return ESP_ERR_INVALID_ARG;
 
     ESP_LOGI(TAG, "Stopping...");
+    EventBits_t expected = 0;
+    if (ml->net_io_task) expected |= ML_EVT_NET_IO_EXITED;
+    if (ml->derp_tx_task) expected |= ML_EVT_DERP_TASK_EXITED;
+    if (ml->coord_task) expected |= ML_EVT_COORD_TASK_EXITED;
+    if (ml->wg_mgr_task) expected |= ML_EVT_WG_TASK_EXITED;
+
     xEventGroupSetBits(ml->events, ML_EVT_SHUTDOWN_REQUEST);
+    if (ml->coord_cmd_queue) {
+        ml_coord_cmd_t cmd = ML_CMD_DISCONNECT;
+        xQueueSend(ml->coord_cmd_queue, &cmd, 0);
+    }
 
-    /* Wait for tasks to exit (they check ML_EVT_SHUTDOWN_REQUEST).
-     * Tasks call vTaskDelete(NULL) to self-delete, so we must NOT call
-     * vTaskDelete() on them again — that causes a crash in uxListRemove
-     * because the task's list node is already invalid. Just wait and
-     * NULL the handles. */
-    vTaskDelay(pdMS_TO_TICKS(3000));
-
-    ml->net_io_task = NULL;
-    ml->derp_tx_task = NULL;
-    ml->coord_task = NULL;
-    ml->wg_mgr_task = NULL;
+    if (expected) {
+        EventBits_t joined = xEventGroupWaitBits(ml->events, expected,
+                                                  pdFALSE, pdTRUE,
+                                                  pdMS_TO_TICKS(30000));
+        if ((joined & expected) != expected) {
+            ESP_LOGE(TAG, "Stop join timeout expected=0x%lx joined=0x%lx",
+                     (unsigned long)expected, (unsigned long)(joined & expected));
+            return ESP_ERR_TIMEOUT;
+        }
+        ESP_LOGI(TAG, "All worker tasks joined bits=0x%lx", (unsigned long)expected);
+    }
 
     /* Stop HTTP config server */
     if (ml->config_httpd) {
@@ -546,7 +556,11 @@ esp_err_t microlink_stop(microlink_t *ml) {
 void microlink_destroy(microlink_t *ml) {
     if (!ml) return;
 
-    microlink_stop(ml);
+    esp_err_t stop_err = microlink_stop(ml);
+    if (stop_err != ESP_OK) {
+        ESP_LOGE(TAG, "Destroy aborted because worker join failed: %s", esp_err_to_name(stop_err));
+        return;
+    }
 
     /* Deinitialize peer NVS */
     ml_peer_nvs_deinit();
