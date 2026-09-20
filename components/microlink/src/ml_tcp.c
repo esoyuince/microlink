@@ -31,6 +31,35 @@ struct microlink_tcp_socket {
     bool connected;
 };
 
+static int tcp_connect_bounded(int fd,const struct sockaddr *addr,socklen_t addrlen,uint32_t timeout_ms)
+{
+#ifdef CONFIG_ML_ENABLE_CELLULAR
+    /* AT sockets own their modem-side connect timeout and don't expose SO_ERROR. */
+    if(ml_at_socket_is_at_fd(fd))return ml_connect(fd,addr,addrlen);
+#endif
+    int flags=ml_fcntl(fd,F_GETFL,0);
+    if(flags<0)return -1;
+    if(ml_fcntl(fd,F_SETFL,flags|O_NONBLOCK)!=0)return -1;
+
+    int rc=ml_connect(fd,addr,addrlen);
+    if(rc==0){ml_fcntl(fd,F_SETFL,flags);return 0;}
+    int first_err=errno;
+    if(first_err!=EINPROGRESS&&first_err!=EWOULDBLOCK&&first_err!=EALREADY){
+        ml_fcntl(fd,F_SETFL,flags);errno=first_err;return -1;
+    }
+
+    fd_set wfds;FD_ZERO(&wfds);FD_SET(fd,&wfds);
+    struct timeval tv={.tv_sec=timeout_ms/1000,.tv_usec=(timeout_ms%1000)*1000};
+    rc=ml_select_fds(fd+1,NULL,&wfds,NULL,&tv);
+    if(rc<=0){int saved=rc==0?ETIMEDOUT:errno;ml_fcntl(fd,F_SETFL,flags);errno=saved;return -1;}
+
+    int soerr=0;socklen_t slen=sizeof(soerr);
+    if(getsockopt(fd,SOL_SOCKET,SO_ERROR,&soerr,&slen)!=0){int saved=errno;ml_fcntl(fd,F_SETFL,flags);errno=saved;return -1;}
+    ml_fcntl(fd,F_SETFL,flags);
+    if(soerr!=0){errno=soerr;return -1;}
+    return 0;
+}
+
 /* ============================================================================
  * Public API
  * ========================================================================== */
@@ -52,40 +81,32 @@ microlink_tcp_socket_t *microlink_tcp_connect(microlink_t *ml, uint32_t dest_ip,
     ESP_LOGI(TAG, "TCP connect to %s:%u (timeout=%lums)", ip_str, dest_port,
              (unsigned long)timeout_ms);
 
+    uint32_t total_budget_ms=timeout_ms>0?timeout_ms:15000;
+    int64_t call_started_us=esp_timer_get_time();
+    int64_t deadline_us=call_started_us+(int64_t)total_budget_ms*1000;
+
     /* Trigger WG handshake + DISCO to wake up the peer connection.
-     * The tunnel may already be up if there's been recent traffic. */
+     * Reserve part of the caller's deadline for the actual TCP connect instead
+     * of spending the entire timeout polling the WG state. */
     ml_wg_mgr_trigger_handshake(ml, dest_ip);
     ml_wg_mgr_send_cmm(ml, dest_ip);
 
-    /* Wait for WG tunnel to establish with this peer.
-     * Poll wireguardif_peer_is_up() — once the WG handshake completes,
-     * lwIP can route TCP through the tunnel. Without a valid session,
-     * connect() will fail with EHOSTUNREACH. */
-    uint32_t wait_ms = 0;
-    uint32_t max_wait = timeout_ms > 0 ? timeout_ms : 15000;
-    bool tunnel_up = ml_wg_mgr_peer_is_up(ml, dest_ip);
-
-    while (!tunnel_up && wait_ms < max_wait) {
-        vTaskDelay(pdMS_TO_TICKS(500));
-        wait_ms += 500;
-
-        tunnel_up = ml_wg_mgr_peer_is_up(ml, dest_ip);
-
-        /* Re-trigger handshake every 5s in case the first was dropped */
-        if (!tunnel_up && (wait_ms % 5000) == 0) {
-            ESP_LOGI(TAG, "WG tunnel not up after %lums, re-triggering handshake",
-                     (unsigned long)wait_ms);
-            ml_wg_mgr_trigger_handshake(ml, dest_ip);
-            ml_wg_mgr_send_cmm(ml, dest_ip);
+    uint32_t wait_ms=0;
+    uint32_t wg_wait_budget=total_budget_ms>1000?total_budget_ms/2:total_budget_ms;
+    if(wg_wait_budget>5000)wg_wait_budget=5000;
+    bool tunnel_up=ml_wg_mgr_peer_is_up(ml,dest_ip);
+    while(!tunnel_up&&wait_ms<wg_wait_budget){
+        uint32_t step=(wg_wait_budget-wait_ms)>500?500:(wg_wait_budget-wait_ms);
+        if(step==0)break;
+        vTaskDelay(pdMS_TO_TICKS(step));wait_ms+=step;
+        tunnel_up=ml_wg_mgr_peer_is_up(ml,dest_ip);
+        if(!tunnel_up&&(wait_ms%2000)==0){
+            ESP_LOGI(TAG,"WG tunnel not up after %lums, re-triggering handshake",(unsigned long)wait_ms);
+            ml_wg_mgr_trigger_handshake(ml,dest_ip);ml_wg_mgr_send_cmm(ml,dest_ip);
         }
     }
-
-    if (tunnel_up) {
-        ESP_LOGI(TAG, "WG tunnel up after %lums", (unsigned long)wait_ms);
-    } else {
-        ESP_LOGW(TAG, "WG tunnel not up after %lums, attempting connect anyway",
-                 (unsigned long)max_wait);
-    }
+    if(tunnel_up)ESP_LOGI(TAG,"WG tunnel up after %lums",(unsigned long)wait_ms);
+    else ESP_LOGW(TAG,"WG tunnel not up after %lums, attempting bounded connect",(unsigned long)wait_ms);
 
     /* Create TCP socket */
     int fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
@@ -112,86 +133,41 @@ microlink_tcp_socket_t *microlink_tcp_connect(microlink_t *ml, uint32_t dest_ip,
         }
     }
 
-    /* Set connect/send timeout */
-    uint32_t remaining = (timeout_ms > wait_ms) ? (timeout_ms - wait_ms) : 10000;
-    struct timeval tv = {
-        .tv_sec = remaining / 1000,
-        .tv_usec = (remaining % 1000) * 1000,
-    };
-    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+    /* Send/recv timeouts apply after connect. connect() itself is bounded
+     * separately with O_NONBLOCK + select + SO_ERROR below. */
+    uint32_t send_timeout_ms=total_budget_ms>5000?5000:total_budget_ms;
+    if(send_timeout_ms==0)send_timeout_ms=1000;
+    struct timeval tv={.tv_sec=send_timeout_ms/1000,.tv_usec=(send_timeout_ms%1000)*1000};
+    setsockopt(fd,SOL_SOCKET,SO_SNDTIMEO,&tv,sizeof(tv));
+    struct timeval rtv={.tv_sec=10,.tv_usec=0};
+    setsockopt(fd,SOL_SOCKET,SO_RCVTIMEO,&rtv,sizeof(rtv));
 
-    /* Set recv timeout */
-    struct timeval rtv = { .tv_sec = 10, .tv_usec = 0 };
-    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &rtv, sizeof(rtv));
+    int keepalive=1,keepidle=30,keepintvl=10,keepcnt=3;
+    setsockopt(fd,SOL_SOCKET,SO_KEEPALIVE,&keepalive,sizeof(keepalive));
+    setsockopt(fd,IPPROTO_TCP,TCP_KEEPIDLE,&keepidle,sizeof(keepidle));
+    setsockopt(fd,IPPROTO_TCP,TCP_KEEPINTVL,&keepintvl,sizeof(keepintvl));
+    setsockopt(fd,IPPROTO_TCP,TCP_KEEPCNT,&keepcnt,sizeof(keepcnt));
+    int nodelay=1;setsockopt(fd,IPPROTO_TCP,TCP_NODELAY,&nodelay,sizeof(nodelay));
 
-    /* TCP keepalive for long-lived connections over VPN */
-    int keepalive = 1;
-    int keepidle = 30;
-    int keepintvl = 10;
-    int keepcnt = 3;
-    setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &keepalive, sizeof(keepalive));
-    setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, &keepidle, sizeof(keepidle));
-    setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &keepintvl, sizeof(keepintvl));
-    setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, &keepcnt, sizeof(keepcnt));
+    struct sockaddr_in dest={.sin_family=AF_INET,.sin_port=htons(dest_port)};
+    dest.sin_addr.s_addr=htonl(dest_ip);
 
-    /* Disable Nagle for low-latency sends */
-    int nodelay = 1;
-    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
-
-    /* Connect */
-    struct sockaddr_in dest = {
-        .sin_family = AF_INET,
-        .sin_port = htons(dest_port),
-    };
-    /* Convert host byte order IP to network byte order */
-    dest.sin_addr.s_addr = htonl(dest_ip);
-
-    int64_t t_start = esp_timer_get_time();
-
-    if (connect(fd, (struct sockaddr *)&dest, sizeof(dest)) != 0) {
-        int err = errno;
-        ESP_LOGE(TAG, "connect() to %s:%u failed: errno=%d", ip_str, dest_port, err);
-
-        /* If tunnel wasn't ready, retry once after triggering handshake again */
-        if (err == EHOSTUNREACH || err == ENETUNREACH || err == ETIMEDOUT) {
-            close(fd);
-            ESP_LOGI(TAG, "Retrying after re-triggering WG handshake...");
-            ml_wg_mgr_trigger_handshake(ml, dest_ip);
-            ml_wg_mgr_send_cmm(ml, dest_ip);
-            vTaskDelay(pdMS_TO_TICKS(3000));
-
-            fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-            if (fd < 0) return NULL;
-
-            /* Bind to VPN IP for routing */
-            if (ml->vpn_ip != 0) {
-                struct sockaddr_in retry_src = {
-                    .sin_family = AF_INET,
-                    .sin_port = 0,
-                    .sin_addr.s_addr = htonl(ml->vpn_ip),
-                };
-                bind(fd, (struct sockaddr *)&retry_src, sizeof(retry_src));
-            }
-
-            setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
-            setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &rtv, sizeof(rtv));
-            setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &keepalive, sizeof(keepalive));
-            setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
-
-            if (connect(fd, (struct sockaddr *)&dest, sizeof(dest)) != 0) {
-                ESP_LOGE(TAG, "Retry connect() failed: errno=%d", errno);
-                close(fd);
-                return NULL;
-            }
-        } else {
-            close(fd);
-            return NULL;
-        }
+    int64_t remaining_us=deadline_us-esp_timer_get_time();
+    if(remaining_us<=0){
+        ESP_LOGW(TAG,"TCP connect deadline exhausted before socket connect");close(fd);return NULL;
+    }
+    uint32_t connect_budget_ms=(uint32_t)((remaining_us+999)/1000);
+    if(connect_budget_ms==0)connect_budget_ms=1;
+    int64_t tcp_started_us=esp_timer_get_time();
+    if(tcp_connect_bounded(fd,(struct sockaddr *)&dest,sizeof(dest),connect_budget_ms)!=0){
+        int err=errno;int64_t elapsed_ms=(esp_timer_get_time()-tcp_started_us)/1000;
+        ESP_LOGE(TAG,"bounded connect to %s:%u failed: errno=%d elapsed=%lldms budget=%lums",ip_str,dest_port,err,elapsed_ms,(unsigned long)connect_budget_ms);
+        close(fd);return NULL;
     }
 
-    int64_t t_end = esp_timer_get_time();
-    ESP_LOGI(TAG, "TCP connected to %s:%u (%lld ms)", ip_str, dest_port,
-             (t_end - t_start) / 1000);
+    int64_t t_end=esp_timer_get_time();
+    ESP_LOGI(TAG,"TCP connected to %s:%u (tcp=%lldms total=%lldms)",ip_str,dest_port,
+             (t_end-tcp_started_us)/1000,(t_end-call_started_us)/1000);
 
     /* Allocate handle */
     microlink_tcp_socket_t *sock = calloc(1, sizeof(microlink_tcp_socket_t));
