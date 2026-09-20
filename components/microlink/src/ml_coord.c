@@ -891,11 +891,16 @@ static int do_register(microlink_t *ml, ml_noise_state_t *noise) {
 
     ESP_LOGI(TAG, "RegisterResponse: %d bytes total data", (int)resp_total);
 
-    if (resp_total == 0) {
-        ESP_LOGW(TAG, "No DATA frame in RegisterResponse");
+    if (!got_end_stream) {
+        ESP_LOGW(TAG, "RegisterResponse incomplete; reconnecting before MapRequest");
         free(resp_buf);
-        /* Not fatal - server may just return headers-only 200 */
-        return 0;
+        return -1;
+    }
+
+    if (resp_total == 0) {
+        ESP_LOGW(TAG, "RegisterResponse has no DATA; reconnecting before MapRequest");
+        free(resp_buf);
+        return -1;
     }
 
     uint8_t *json_data = resp_buf;
@@ -927,9 +932,9 @@ static int do_register(microlink_t *ml, ml_noise_state_t *noise) {
         parse_start += json_offset;
         parse_len -= json_offset;
     } else if (json_offset < 0) {
-        ESP_LOGW(TAG, "No '{' found in RegisterResponse data");
+        ESP_LOGW(TAG, "RegisterResponse has no JSON; reconnecting before MapRequest");
         free(resp_buf);
-        return 0;
+        return -1;
     }
 
     /* Null-terminate for cJSON */
@@ -942,7 +947,7 @@ static int do_register(microlink_t *ml, ml_noise_state_t *noise) {
         ESP_LOGW(TAG, "First 100 chars: %.100s", parse_start);
         parse_start[parse_len] = saved;
         free(resp_buf);
-        return 0;  /* Not fatal - we'll get peers in MapResponse */
+        return -1;
     }
     parse_start[parse_len] = saved;
     free(resp_buf);
